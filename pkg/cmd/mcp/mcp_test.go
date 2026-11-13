@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -86,6 +87,7 @@ func (p *peer) call(t *testing.T, method string, params any) map[string]any {
 func isolatedConfig(t *testing.T) {
 	t.Helper()
 	t.Setenv("GH_CONFIG_DIR", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	for _, name := range []string{"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_HOST", "GH_REPO"} {
 		t.Setenv(name, "")
 	}
@@ -140,11 +142,17 @@ func TestNativeEventsReplayAndRepositoryOverride(t *testing.T) {
 	require.Equal(t, true, wrongFilter["truncated"])
 	require.Empty(t, wrongFilter["events"])
 	otherRegistry := &httpmock.Registry{}
-	otherRegistry.Register(actionsRequest(t), httpmock.JSONResponse(map[string]any{"workflow_runs": []any{run(1, "main", "completed")}}))
+	otherRegistry.Register(actionsRequest(t), httpmock.JSONResponse(map[string]any{"workflow_runs": []any{
+		run(1, "main", "completed"), run(2, "topic", "completed"), run(3, "main", "completed"),
+	}}))
 	restarted := startPeer(t, otherRegistry)
 	gap := restarted.call(t, "events/poll", map[string]any{"name": name, "cursor": last["cursor"]})
-	require.Equal(t, true, gap["truncated"], "a process restart must expose lost replay history")
-	require.Empty(t, gap["events"])
+	require.Equal(t, false, gap["truncated"], "a process restart preserves the saved observation cursor")
+	require.Len(t, gap["events"], 1)
+	require.Equal(t, float64(3), gap["events"].([]any)[0].(map[string]any)["data"].(map[string]any)["run_id"])
+	retained := restarted.call(t, "events/poll", map[string]any{"name": name, "cursor": first["cursor"]})
+	require.Len(t, retained["events"], 3, "old observations and the offline change remain replayable")
+	require.Equal(t, events[0], retained["events"].([]any)[0], "event IDs survive a server restart")
 }
 
 func TestCancellationReleasesAPICallAndOtherRequestsContinue(t *testing.T) {
@@ -193,9 +201,97 @@ func TestProtocolErrorsAndUpstreamAccess(t *testing.T) {
 		{"events/poll", map[string]any{"name": "github.workflow_run"}, -32025},
 		{"events/poll", map[string]any{"name": "github.workflow_run"}, -32024},
 	} {
+		if test.code == -32024 {
+			time.Sleep(1020 * time.Millisecond)
+		}
 		client.send(t, "request", test.method, test.params)
 		frame := client.read(t)
 		require.Equal(t, test.code, frame["error"].(map[string]any)["code"])
 	}
 	require.NotEmpty(t, client.call(t, "events/list", map[string]any{})["events"], "a bad request must not kill the server")
+}
+
+func TestGitHubRateLimitCooldownIsSharedByPollers(t *testing.T) {
+	isolatedConfig(t)
+	registry := &httpmock.Registry{}
+	registry.Register(actionsRequest(t), func(request *http.Request) (*http.Response, error) {
+		response, err := httpmock.StatusJSONResponse(429, map[string]any{"message": "rate limited"})(request)
+		if err != nil {
+			return nil, err
+		}
+		response.Header.Set("Retry-After", "1")
+		return response, nil
+	})
+	registry.Register(actionsRequest(t), httpmock.JSONResponse(map[string]any{"workflow_runs": []any{}}))
+	client := startPeer(t, registry)
+	for index := range 2 {
+		client.send(t, "request", "events/poll", map[string]any{"name": "github.workflow_run", "arguments": map[string]any{"branch": fmt.Sprint(index)}})
+		frame := client.read(t)
+		failure, ok := frame["error"].(map[string]any)
+		require.True(t, ok, "a second poll must retain the upstream cooldown: %v", frame)
+		require.Equal(t, float64(-32025), failure["code"])
+		require.Greater(t, failure["data"].(map[string]any)["retryAfterMs"].(float64), float64(0))
+	}
+	time.Sleep(1020 * time.Millisecond)
+	require.Empty(t, client.call(t, "events/poll", map[string]any{"name": "github.workflow_run"})["events"])
+}
+
+func TestGitHubRateLimitResetAdvice(t *testing.T) {
+	for _, test := range []struct {
+		name, header string
+		value        func() string
+	}{
+		{"seconds", "Retry-After", func() string { return "5" }},
+		{"http_date", "Retry-After", func() string { return time.Now().Add(5 * time.Second).UTC().Format(http.TimeFormat) }},
+		{"reset", "X-RateLimit-Reset", func() string { return fmt.Sprint(time.Now().Add(5 * time.Second).Unix()) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			isolatedConfig(t)
+			registry := &httpmock.Registry{}
+			registry.Register(actionsRequest(t), func(request *http.Request) (*http.Response, error) {
+				response, err := httpmock.StatusJSONResponse(429, map[string]any{"message": "rate limited"})(request)
+				if err != nil {
+					return nil, err
+				}
+				response.Header.Set(test.header, test.value())
+				return response, nil
+			})
+			client := startPeer(t, registry)
+			client.send(t, "request", "events/poll", map[string]any{"name": "github.workflow_run"})
+			failure := client.read(t)["error"].(map[string]any)
+			require.Equal(t, float64(-32025), failure["code"])
+			delay, ok := failure["data"].(map[string]any)["retryAfterMs"].(float64)
+			require.True(t, ok, "the server must forward GitHub retry advice")
+			require.Greater(t, delay, float64(3000))
+			require.LessOrEqual(t, delay, float64(5000))
+		})
+	}
+}
+
+func TestCheckpointFailureRetainsReplayPosition(t *testing.T) {
+	isolatedConfig(t)
+	registry := &httpmock.Registry{}
+	registry.Register(actionsRequest(t), httpmock.JSONResponse(map[string]any{"workflow_runs": []any{run(1, "main", "in_progress")}}))
+	for range 2 {
+		registry.Register(actionsRequest(t), httpmock.JSONResponse(map[string]any{"workflow_runs": []any{run(1, "main", "completed")}}))
+	}
+	client := startPeer(t, registry)
+	first := client.call(t, "events/poll", map[string]any{"name": "github.workflow_run"})
+	directory := filepath.Join(os.Getenv("XDG_CACHE_HOME"), "gh", "mcp-events")
+	require.NoError(t, os.Rename(directory, directory+".held"))
+	require.NoError(t, os.WriteFile(directory, []byte("blocked checkpoint directory"), 0600))
+	time.Sleep(1020 * time.Millisecond)
+	client.send(t, "request", "events/poll", map[string]any{"name": "github.workflow_run", "cursor": first["cursor"]})
+	failure := client.read(t)
+	require.Equal(t, float64(-32603), failure["error"].(map[string]any)["code"])
+	require.NotContains(t, failure, "result", "uncommitted observations must not advance the cursor")
+	require.NoError(t, os.Remove(directory))
+	require.NoError(t, os.Rename(directory+".held", directory))
+	time.Sleep(1020 * time.Millisecond)
+	page := client.call(t, "events/poll", map[string]any{"name": "github.workflow_run", "cursor": first["cursor"]})
+	require.Equal(t, false, page["truncated"])
+	events := page["events"].([]any)
+	require.Len(t, events, 1)
+	require.Equal(t, "completed", events[0].(map[string]any)["data"].(map[string]any)["status"])
+	require.Empty(t, client.call(t, "events/poll", map[string]any{"name": "github.workflow_run", "cursor": page["cursor"]})["events"])
 }

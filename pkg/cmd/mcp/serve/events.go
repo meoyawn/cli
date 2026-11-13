@@ -78,8 +78,7 @@ type bufferedEvent struct {
 	value    occurrence
 }
 
-// All observation state is owned by gate. Cursors are process-scoped, and a
-// restart is reported as a replay gap instead of claiming durable history.
+// All observation state and checkpoint writes are owned by gate.
 type eventSource struct {
 	client     *api.Client
 	repo       ghrepo.Interface
@@ -91,6 +90,8 @@ type eventSource struct {
 	previous   map[int64]string
 	runs       []workflowRun
 	buffer     []bufferedEvent
+	checkpoint string
+	retryAt    time.Time
 }
 
 func newSource(client *api.Client, repo ghrepo.Interface, interval time.Duration) *eventSource {
@@ -148,8 +149,8 @@ func (s *eventSource) handle(ctx context.Context, request rpcRequest) (any, *rpc
 			if params.MaxEvents != nil && (*params.MaxEvents < 1 || *params.MaxEvents > 100) {
 				return nil, &rpcError{Code: -32602, Message: fmt.Sprintf("maxEvents must be between 1 and 100: %d", *params.MaxEvents)}
 			}
-			if err := s.refresh(ctx); err != nil {
-				return nil, upstreamError(err)
+			if failure := s.refresh(ctx); failure != nil {
+				return nil, failure
 			}
 			return s.poll(params), nil
 		}
@@ -166,8 +167,8 @@ func (s *eventSource) handle(ctx context.Context, request rpcRequest) (any, *rpc
 		if len(params.Arguments) != 0 {
 			return nil, &rpcError{Code: -32602, Message: "list_workflow_runs arguments must be empty"}
 		}
-		if err := s.refresh(ctx); err != nil {
-			return nil, upstreamError(err)
+		if failure := s.refresh(ctx); failure != nil {
+			return nil, failure
 		}
 		data := map[string]any{"repository": ghrepo.FullName(s.repo), "workflow_runs": s.runs}
 		encoded, err := json.Marshal(data)
@@ -182,10 +183,42 @@ func (s *eventSource) handle(ctx context.Context, request rpcRequest) (any, *rpc
 	}
 }
 
-func (s *eventSource) refresh(ctx context.Context) error {
+func (s *eventSource) refresh(ctx context.Context) *rpcError {
+	if remaining := time.Until(s.retryAt); remaining > 0 {
+		return &rpcError{Code: -32025, Message: "ResourceExhausted", Data: map[string]any{
+			"limit": "github_api", "retryAfterMs": remaining.Milliseconds() + 1,
+		}}
+	}
 	if !s.lastRead.IsZero() && time.Since(s.lastRead) < s.interval {
 		return nil
 	}
+	previous := s.snapshot()
+	if err := s.readRuns(ctx); err != nil {
+		failure := upstreamError(err)
+		if ctx.Err() == nil && failure.Code != -32024 {
+			delay := s.interval.Milliseconds()
+			if advised, ok := failure.Data["retryAfterMs"].(int64); ok {
+				delay = max(delay, advised)
+			}
+			s.retryAt = time.Now().Add(time.Duration(delay) * time.Millisecond)
+			if failure.Data == nil {
+				failure.Data = map[string]any{}
+			}
+			failure.Data["retryAfterMs"] = delay
+		}
+		return failure
+	}
+	if err := s.save(); err != nil {
+		s.restore(previous)
+		s.lastRead = time.Time{}
+		s.retryAt = time.Now().Add(s.interval)
+		return &rpcError{Code: -32603, Message: "Could not checkpoint GitHub Actions observations",
+			Data: map[string]any{"retryAfterMs": s.interval.Milliseconds()}}
+	}
+	return nil
+}
+
+func (s *eventSource) readRuns(ctx context.Context) error {
 	fetch, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	path := fmt.Sprintf("repos/%s/%s/actions/runs?per_page=100", url.PathEscape(s.repo.RepoOwner()), url.PathEscape(s.repo.RepoName()))
@@ -244,6 +277,7 @@ func (s *eventSource) refresh(ctx context.Context) error {
 	}
 	s.previous = next
 	s.lastRead = time.Now()
+	s.retryAt = time.Time{}
 	return nil
 }
 
@@ -302,6 +336,10 @@ func upstreamError(err error) *rpcError {
 				data["limit"] = "github_api"
 				if retry, parseErr := strconv.Atoi(failure.Headers.Get("Retry-After")); parseErr == nil {
 					data["retryAfterMs"] = int64(retry) * 1000
+				} else if retry, parseErr := http.ParseTime(failure.Headers.Get("Retry-After")); parseErr == nil {
+					data["retryAfterMs"] = max(int64(0), time.Until(retry).Milliseconds())
+				} else if reset, parseErr := strconv.ParseInt(failure.Headers.Get("X-RateLimit-Reset"), 10, 64); parseErr == nil {
+					data["retryAfterMs"] = max(int64(0), time.Until(time.Unix(reset, 0)).Milliseconds())
 				}
 				return &rpcError{Code: -32025, Message: "ResourceExhausted", Data: data}
 			}

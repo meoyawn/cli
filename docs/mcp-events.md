@@ -32,11 +32,20 @@ Concurrent subscriptions reuse the same observation cache.
 The source samples the latest 100 Actions runs. Intermediate transitions may
 coalesce between reads, and a busy repository can have runs outside that
 window. This is an observed-state feed, not GitHub's durable webhook history.
-The server retains 512 observed changes in memory, with stable event IDs for
-deduplication. A process restart, expired buffer position, mismatched filter,
-or replay age limit reports `truncated: true`. Cursors do not promise replay
-across a server restart. Cancelled JSON-RPC requests cancel their GitHub API
+The server retains 512 observed changes with stable event IDs for deduplication.
+Observations and their cursor generation are atomically checkpointed in the gh
+cache directory, under `mcp-events`, before they are returned to a client.
+Restarting `go run` resumes that history and compares the latest API snapshot
+with the saved runs, catching changes observed after the outage. An expired
+buffer position, mismatched filter, missing checkpoint, or replay age limit
+reports `truncated: true`. Cancelled JSON-RPC requests cancel their GitHub API
 requests; stdin EOF or process termination releases the whole server.
+
+Upstream failures put the shared source into a cooldown, so parallel subscribers
+cannot repeatedly hit GitHub while it is unavailable. Errors carry
+`retryAfterMs`; GitHub's `Retry-After` (seconds or HTTP date) and rate-limit reset
+headers determine the minimum retry delay. Clients should retry transient errors
+with bounded backoff instead of discarding a saved watch.
 
 A native Events client such as Happen owns the polling loop between agent
 turns. While Happen's server is running, a subscription owned by a saved thread

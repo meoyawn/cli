@@ -81,6 +81,9 @@ func serveRun(ctx context.Context, opts *serveOptions) error {
 		return err
 	}
 	source := newSource(api.NewClientFromHTTP(httpClient), repo, opts.interval)
+	if err := source.openCheckpoint(); err != nil {
+		return err
+	}
 	group, lifetime := errgroup.WithContext(ctx)
 	var output sync.Mutex
 	send := func(id json.RawMessage, result any, failure *rpcError) error {
