@@ -155,6 +155,75 @@ func TestNativeEventsReplayAndRepositoryOverride(t *testing.T) {
 	require.Equal(t, events[0], retained["events"].([]any)[0], "event IDs survive a server restart")
 }
 
+func TestSubscriptionsSelectIndependentRepositoriesAndResumeAfterRestart(t *testing.T) {
+	isolatedConfig(t)
+	repositories := []struct {
+		selector, name, host, path string
+	}{
+		{"https://github.com/listenbox/client", "listenbox/client", "api.github.com", "repos/listenbox/client/actions/runs"},
+		{"github.com/listenbox/listenbox2", "listenbox/listenbox2", "api.github.com", "repos/listenbox/listenbox2/actions/runs"},
+		{"listenbox/client", "listenbox/client", "github.example", "api/v3/repos/listenbox/client/actions/runs"},
+	}
+	registry := func(status string) *httpmock.Registry {
+		value := &httpmock.Registry{}
+		for _, repository := range repositories {
+			value.Register(httpmock.WithHost(httpmock.REST(http.MethodGet, repository.path), repository.host),
+				httpmock.JSONResponse(map[string]any{"workflow_runs": []any{run(1, "main", status)}}))
+		}
+		return value
+	}
+	client := startPeer(t, registry("in_progress"))
+	cursors := make([]any, len(repositories))
+	for index, repository := range repositories {
+		page := client.call(t, "events/poll", map[string]any{
+			"name": "github.workflow_run", "arguments": map[string]any{"repository": repository.selector},
+		})
+		require.Empty(t, page["events"])
+		require.Equal(t, false, page["truncated"])
+		cursors[index] = page["cursor"]
+		snapshot := client.call(t, "tools/call", map[string]any{
+			"name": "list_workflow_runs", "arguments": map[string]any{"repository": repository.selector},
+		})["structuredContent"].(map[string]any)
+		require.Equal(t, repository.name, snapshot["repository"])
+		require.Equal(t, "in_progress", snapshot["workflow_runs"].([]any)[0].(map[string]any)["status"])
+	}
+	restarted := startPeer(t, registry("completed"))
+	ids := map[any]bool{}
+	for index, repository := range repositories {
+		page := restarted.call(t, "events/poll", map[string]any{
+			"name": "github.workflow_run", "arguments": map[string]any{"repository": repository.selector}, "cursor": cursors[index],
+		})
+		require.Equal(t, false, page["truncated"], "each repository must resume its own saved cursor")
+		events := page["events"].([]any)
+		require.Len(t, events, 1)
+		event := events[0].(map[string]any)
+		require.Equal(t, repository.name, event["data"].(map[string]any)["repository"])
+		require.Equal(t, "completed", event["data"].(map[string]any)["status"])
+		require.False(t, ids[event["eventId"]], "identical run IDs on different repositories and hosts must not collide")
+		ids[event["eventId"]] = true
+		wrong := restarted.call(t, "events/poll", map[string]any{
+			"name": "github.workflow_run", "arguments": map[string]any{"repository": repository.selector},
+			"cursor": cursors[(index+1)%len(repositories)],
+		})
+		require.Equal(t, true, wrong["truncated"])
+		require.Empty(t, wrong["events"], "another repository's cursor must not replay this repository's history")
+	}
+}
+
+func TestRepositoryAccessFailureDoesNotDisableOtherSubscriptions(t *testing.T) {
+	isolatedConfig(t)
+	registry := &httpmock.Registry{}
+	registry.Register(httpmock.WithHost(httpmock.REST(http.MethodGet, "repos/listenbox/missing/actions/runs"), "api.github.com"),
+		httpmock.StatusJSONResponse(404, map[string]any{"message": "Not Found"}))
+	registry.Register(actionsRequest(t), httpmock.JSONResponse(map[string]any{"workflow_runs": []any{}}))
+	client := startPeer(t, registry)
+	client.send(t, "request", "events/poll", map[string]any{
+		"name": "github.workflow_run", "arguments": map[string]any{"repository": "github.com/listenbox/missing"},
+	})
+	require.Equal(t, float64(-32024), client.read(t)["error"].(map[string]any)["code"])
+	require.Empty(t, client.call(t, "events/poll", map[string]any{"name": "github.workflow_run"})["events"])
+}
+
 func TestCancellationReleasesAPICallAndOtherRequestsContinue(t *testing.T) {
 	isolatedConfig(t)
 	registry := &httpmock.Registry{}
@@ -166,6 +235,8 @@ func TestCancellationReleasesAPICallAndOtherRequestsContinue(t *testing.T) {
 		return nil, request.Context().Err()
 	})
 	registry.Register(actionsRequest(t), httpmock.JSONResponse(map[string]any{"workflow_runs": []any{}}))
+	registry.Register(httpmock.WithHost(httpmock.REST(http.MethodGet, "repos/listenbox/client/actions/runs"), "api.github.com"),
+		httpmock.JSONResponse(map[string]any{"workflow_runs": []any{}}))
 	client := startPeer(t, registry)
 	client.send(t, 1, "events/poll", map[string]any{"name": "github.workflow_run"})
 	select {
@@ -173,6 +244,9 @@ func TestCancellationReleasesAPICallAndOtherRequestsContinue(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("GitHub request did not start")
 	}
+	require.Empty(t, client.call(t, "events/poll", map[string]any{
+		"name": "github.workflow_run", "arguments": map[string]any{"repository": "https://github.com/listenbox/client"},
+	})["events"], "a blocked repository must not block another repository's subscription")
 	client.send(t, nil, "notifications/cancelled", map[string]any{"requestId": 1})
 	select {
 	case <-cancelled:
@@ -197,6 +271,11 @@ func TestProtocolErrorsAndUpstreamAccess(t *testing.T) {
 		{"events/poll", map[string]any{"name": "missing"}, -32023},
 		{"events/poll", map[string]any{"name": "github.workflow_run", "maxEvents": 0}, -32602},
 		{"events/poll", map[string]any{"name": "github.workflow_run", "arguments": map[string]any{"typo": true}}, -32602},
+		{"events/poll", map[string]any{"name": "github.workflow_run", "arguments": map[string]any{"repository": "owner-without-repository"}}, -32602},
+		{"events/poll", map[string]any{"name": "github.workflow_run", "arguments": map[string]any{"repository": 1}}, -32602},
+		{"tools/call", map[string]any{"name": "list_workflow_runs", "arguments": map[string]any{"repository": 1}}, -32602},
+		{"tools/call", map[string]any{"name": "list_workflow_runs", "arguments": map[string]any{"repository": "owner-without-repository"}}, -32602},
+		{"tools/call", map[string]any{"name": "list_workflow_runs", "arguments": map[string]any{"branch": "main"}}, -32602},
 		{"events/stream", map[string]any{"name": "github.workflow_run"}, -32026},
 		{"events/poll", map[string]any{"name": "github.workflow_run"}, -32025},
 		{"events/poll", map[string]any{"name": "github.workflow_run"}, -32024},

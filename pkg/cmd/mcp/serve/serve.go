@@ -80,8 +80,8 @@ func serveRun(ctx context.Context, opts *serveOptions) error {
 	if err != nil {
 		return err
 	}
-	source := newSource(api.NewClientFromHTTP(httpClient), repo, opts.interval)
-	if err := source.openCheckpoint(); err != nil {
+	source, err := newServer(api.NewClientFromHTTP(httpClient), repo, opts.interval)
+	if err != nil {
 		return err
 	}
 	group, lifetime := errgroup.WithContext(ctx)

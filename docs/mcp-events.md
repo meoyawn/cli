@@ -21,13 +21,28 @@ modes. Push and webhook delivery are not advertised. Discovery uses MCP
 legacy `initialize`. A read-only `list_workflow_runs` MCP tool exposes current
 run snapshots for context. There are no `wait_for_event` or `poll_events` tools.
 
+The optional `repository` subscription argument selects any accessible repository
+as `OWNER/REPO`, `HOST/OWNER/REPO`, or a full repository URL. Omitting it uses the
+server's selected repository, including `-R` and `GH_REPO`. An `OWNER/REPO` value
+uses the server's selected host. The `list_workflow_runs` tool accepts the same
+argument. One server can watch multiple repositories and GitHub Enterprise hosts:
+
+```json
+[
+  {"repository": "github.com/listenbox/client", "branch": "master", "status": "completed"},
+  {"repository": "github.com/listenbox/listenbox2", "branch": "master", "status": "completed"}
+]
+```
+
 Optional subscription arguments `branch`, `workflow`, `status`, and `conclusion`
-are exact-match filters. Omitted arguments watch every observed change in the
+are exact-match filters. Omitted filters watch every observed change in the
 selected repository. A null or omitted cursor bootstraps from now, returning
 no historical events. A client retains the response-level cursor and polls
 again after `nextPollMs` (default 15000); `hasMore` drains a partial batch
 immediately. `--interval` controls the minimum time between shared API reads.
-Concurrent subscriptions reuse the same observation cache.
+Concurrent subscriptions for the same repository reuse its observation cache.
+Repositories have independent API requests, cooldowns, checkpoints and cursors;
+a stalled or inaccessible repository does not block another repository's watch.
 
 The source samples the latest 100 Actions runs. Intermediate transitions may
 coalesce between reads, and a busy repository can have runs outside that

@@ -13,6 +13,8 @@ import (
 	"net/url"
 	"sort"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/cli/cli/v2/api"
@@ -35,6 +37,7 @@ type workflowRun struct {
 }
 
 type filters struct {
+	Repository string `json:"repository,omitempty"`
 	Branch     string `json:"branch,omitempty"`
 	Workflow   string `json:"workflow,omitempty"`
 	Status     string `json:"status,omitempty"`
@@ -99,7 +102,51 @@ func newSource(client *api.Client, repo ghrepo.Interface, interval time.Duration
 		gate: make(chan struct{}, 1), generation: uuid.NewString()}
 }
 
-func (s *eventSource) handle(ctx context.Context, request rpcRequest) (any, *rpcError) {
+type eventServer struct {
+	client   *api.Client
+	repo     ghrepo.Interface
+	interval time.Duration
+	mutex    sync.Mutex
+	sources  map[string]*eventSource
+}
+
+func repositoryKey(repo ghrepo.Interface) string {
+	return strings.ToLower(repo.RepoHost() + "/" + ghrepo.FullName(repo))
+}
+
+func newServer(client *api.Client, repo ghrepo.Interface, interval time.Duration) (*eventServer, error) {
+	source := newSource(client, repo, interval)
+	if err := source.openCheckpoint(); err != nil {
+		return nil, err
+	}
+	return &eventServer{client: client, repo: repo, interval: interval,
+		sources: map[string]*eventSource{repositoryKey(repo): source}}, nil
+}
+
+func (s *eventServer) source(repository string) (*eventSource, *rpcError) {
+	repo := s.repo
+	if repository != "" {
+		var err error
+		repo, err = ghrepo.FromFullNameWithHost(repository, s.repo.RepoHost())
+		if err != nil {
+			return nil, &rpcError{Code: -32602, Message: fmt.Sprintf("Invalid repository: %s", err)}
+		}
+	}
+	key := repositoryKey(repo)
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if source, ok := s.sources[key]; ok {
+		return source, nil
+	}
+	source := newSource(s.client, repo, s.interval)
+	if err := source.openCheckpoint(); err != nil {
+		return nil, &rpcError{Code: -32603, Message: "Could not open GitHub Actions observation checkpoint"}
+	}
+	s.sources[key] = source
+	return source, nil
+}
+
+func (s *eventServer) handle(ctx context.Context, request rpcRequest) (any, *rpcError) {
 	switch request.Method {
 	case "server/discover":
 		return map[string]any{
@@ -124,17 +171,13 @@ func (s *eventSource) handle(ctx context.Context, request rpcRequest) (any, *rpc
 		}
 		return map[string]any{"tools": []any{map[string]any{
 			"name":        "list_workflow_runs",
-			"description": "Read the latest 100 GitHub Actions runs for " + ghrepo.FullName(s.repo) + ". To watch future changes between turns, subscribe to the native github.workflow_run event through the client's MCP Events tools.",
-			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false},
+			"description": "Read the latest 100 GitHub Actions runs for any accessible repository. Defaults to " + ghrepo.FullName(s.repo) + ". To watch future changes between turns, subscribe to the native github.workflow_run event through the client's MCP Events tools.",
+			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{"repository": repositoryArgument()}, "additionalProperties": false},
 			"annotations": map[string]any{"readOnlyHint": true, "openWorldHint": true},
 		}}}, nil
 	case "events/poll", "tools/call":
-		select {
-		case s.gate <- struct{}{}:
-			defer func() { <-s.gate }()
-		case <-ctx.Done():
-			return nil, nil
-		}
+		var repository string
+		var poll *pollParams
 		if request.Method == "events/poll" {
 			var params pollParams
 			if failure := decodeParams(request.Params, &params); failure != nil {
@@ -149,28 +192,43 @@ func (s *eventSource) handle(ctx context.Context, request rpcRequest) (any, *rpc
 			if params.MaxEvents != nil && (*params.MaxEvents < 1 || *params.MaxEvents > 100) {
 				return nil, &rpcError{Code: -32602, Message: fmt.Sprintf("maxEvents must be between 1 and 100: %d", *params.MaxEvents)}
 			}
-			if failure := s.refresh(ctx); failure != nil {
+			repository, poll = params.Arguments.Repository, &params
+		} else {
+			var params struct {
+				Name      string         `json:"name"`
+				Arguments map[string]any `json:"arguments"`
+			}
+			if failure := decodeParams(request.Params, &params); failure != nil {
 				return nil, failure
 			}
-			return s.poll(params), nil
+			if params.Name != "list_workflow_runs" {
+				return nil, &rpcError{Code: -32602, Message: fmt.Sprintf("Unknown tool name %q", params.Name)}
+			}
+			if len(params.Arguments) != 0 {
+				var ok bool
+				repository, ok = params.Arguments["repository"].(string)
+				if !ok || len(params.Arguments) != 1 {
+					return nil, &rpcError{Code: -32602, Message: "list_workflow_runs only accepts a repository string argument"}
+				}
+			}
 		}
-		var params struct {
-			Name      string         `json:"name"`
-			Arguments map[string]any `json:"arguments"`
-		}
-		if failure := decodeParams(request.Params, &params); failure != nil {
+		source, failure := s.source(repository)
+		if failure != nil {
 			return nil, failure
 		}
-		if params.Name != "list_workflow_runs" {
-			return nil, &rpcError{Code: -32602, Message: fmt.Sprintf("Unknown tool name %q", params.Name)}
+		select {
+		case source.gate <- struct{}{}:
+			defer func() { <-source.gate }()
+		case <-ctx.Done():
+			return nil, nil
 		}
-		if len(params.Arguments) != 0 {
-			return nil, &rpcError{Code: -32602, Message: "list_workflow_runs arguments must be empty"}
-		}
-		if failure := s.refresh(ctx); failure != nil {
+		if failure := source.refresh(ctx); failure != nil {
 			return nil, failure
 		}
-		data := map[string]any{"repository": ghrepo.FullName(s.repo), "workflow_runs": s.runs}
+		if poll != nil {
+			return source.poll(*poll), nil
+		}
+		data := map[string]any{"repository": ghrepo.FullName(source.repo), "workflow_runs": source.runs}
 		encoded, err := json.Marshal(data)
 		if err != nil {
 			return nil, &rpcError{Code: -32603, Message: "Could not encode workflow runs"}
@@ -351,8 +409,12 @@ func upstreamError(err error) *rpcError {
 	return &rpcError{Code: -32603, Message: "GitHub Actions API read failed"}
 }
 
+func repositoryArgument() map[string]any {
+	return map[string]any{"type": "string", "description": "Repository as [HOST/]OWNER/REPO or a full URL. Defaults to the server's selected repository and host."}
+}
+
 func eventDescriptor(repo ghrepo.Interface) map[string]any {
-	properties := map[string]any{}
+	properties := map[string]any{"repository": repositoryArgument()}
 	for _, name := range []string{"branch", "workflow", "status", "conclusion"} {
 		properties[name] = map[string]any{"type": "string"}
 	}
@@ -364,7 +426,7 @@ func eventDescriptor(repo ghrepo.Interface) map[string]any {
 	payload["conclusion"] = map[string]any{"type": []string{"string", "null"}}
 	return map[string]any{
 		"name":          eventName,
-		"description":   "Observed GitHub Actions run state changes in " + ghrepo.FullName(repo) + ". Filters use exact matches. Uses the current gh login. Intermediate transitions can coalesce between API reads; cursors survive only for this server process and up to 512 observed changes.",
+		"description":   "Observed GitHub Actions run state changes for any accessible repository. Defaults to " + ghrepo.FullName(repo) + ". Filters use exact matches. Uses the current gh login. Intermediate transitions can coalesce between API reads; cursors and up to 512 observed changes are checkpointed per repository.",
 		"delivery":      []string{"poll"},
 		"inputSchema":   map[string]any{"type": "object", "properties": properties, "additionalProperties": false},
 		"payloadSchema": map[string]any{"type": "object", "properties": payload, "required": []string{"repository", "run_id", "workflow", "status", "conclusion", "branch", "head_sha", "url", "attempt"}, "additionalProperties": false},
