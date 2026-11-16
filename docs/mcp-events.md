@@ -43,9 +43,22 @@ requests. Missing required metadata returns `InvalidParams` (`-32602`). An
 unsupported version returns `UnsupportedProtocolVersion` (`-32022`) with the
 requested and supported versions.
 
+The optional `repository` subscription argument selects any accessible repository
+as `OWNER/REPO`, `HOST/OWNER/REPO`, or a full repository URL. Omitting it uses the
+server's selected repository, including `-R` and `GH_REPO`. An `OWNER/REPO` value
+uses the server's selected host. The `list_workflow_runs` tool accepts the same
+argument. One server can watch multiple repositories and GitHub Enterprise hosts:
+
+```json
+[
+  {"repository": "github.com/listenbox/client", "branch": "master", "status": "completed"},
+  {"repository": "github.com/listenbox/listenbox2", "branch": "master", "status": "completed"}
+]
+```
+
 Optional subscription arguments `branch`, `workflow`, `status`, and `conclusion`
 are exact-match string filters, including an explicitly empty string. Null values
-are invalid. Omitted arguments watch every observed change in the
+are invalid. Omitted filters watch every observed change in the
 selected repository. A null or omitted cursor bootstraps from now, returning
 no historical events. A client retains the response-level cursor and polls
 again after `nextPollMs` (default 15000); `hasMore` drains a partial batch
@@ -53,7 +66,9 @@ immediately. `maxEvents` caps each batch, with a default of 50 and a server ceil
 of 100; larger requested caps are accepted. `maxAgeMs` optionally bounds replay
 by age and is ignored when starting from now. `--interval` controls the minimum
 time between shared API reads.
-Concurrent subscriptions reuse the same observation cache.
+Concurrent subscriptions for the same repository reuse its observation cache.
+Repositories have independent API requests, cooldowns, checkpoints and cursors;
+a stalled or inaccessible repository does not block another repository's watch.
 
 The source samples the latest 100 Actions runs. Intermediate transitions may
 coalesce between reads, and a busy repository can have runs outside that
