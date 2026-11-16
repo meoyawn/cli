@@ -2,6 +2,7 @@ package serve
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -23,6 +24,8 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+const protocolVersion = "2026-07-28"
+
 type serveOptions struct {
 	io         *iostreams.IOStreams
 	httpClient func() (*http.Client, error)
@@ -36,7 +39,7 @@ func NewCmdServe(f *cmdutil.Factory) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Serve native MCP Events over stdio using the current gh login",
-		Long:  "Serve GitHub Actions state changes using the experimental MCP Events draft.\nSupports events/list and events/poll. Polling continues in the MCP client between agent turns.\nOnly read-only GitHub API requests are made. Stdout contains JSON-RPC exclusively.",
+		Long:  "Serve GitHub Actions state changes using the MCP Events extension (SEP-3415).\nSupports events/list and events/poll with protocol version 2026-07-28.\nPolling continues in the MCP client between agent turns.\nOnly read-only GitHub API requests are made. Stdout contains JSON-RPC exclusively.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.baseRepo = f.BaseRepo
@@ -86,11 +89,15 @@ func serveRun(ctx context.Context, opts *serveOptions) error {
 	}
 	group, lifetime := errgroup.WithContext(ctx)
 	var output sync.Mutex
-	send := func(id json.RawMessage, result any, failure *rpcError) error {
+	send := func(id json.RawMessage, result map[string]any, failure *rpcError) error {
 		frame := map[string]any{"jsonrpc": "2.0", "id": id}
 		if failure != nil {
 			frame["error"] = failure
 		} else {
+			result["resultType"] = "complete"
+			result["_meta"] = map[string]any{
+				"io.modelcontextprotocol/serverInfo": map[string]any{"name": "gh-mcp-events", "version": "0.1.0"},
+			}
 			frame["result"] = result
 		}
 		output.Lock()
@@ -208,15 +215,16 @@ func validID(id json.RawMessage) bool {
 	if len(id) > 1024 {
 		return false
 	}
-	var text string
+	var text *string
 	if json.Unmarshal(id, &text) == nil {
-		return true
+		return text != nil
 	}
 	_, err := strconv.ParseInt(string(id), 10, 64)
 	return err == nil
 }
 
 func decodeParams(raw json.RawMessage, target any) *rpcError {
+	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 {
 		raw = json.RawMessage(`{}`)
 	}
@@ -225,6 +233,30 @@ func decodeParams(raw json.RawMessage, target any) *rpcError {
 	}
 	if err := json.Unmarshal(raw, target); err != nil {
 		return &rpcError{Code: -32602, Message: fmt.Sprintf("Invalid params: %s", err)}
+	}
+	return nil
+}
+
+func validateRequestParams(raw json.RawMessage) *rpcError {
+	var params struct {
+		Meta struct {
+			Version      *string                    `json:"io.modelcontextprotocol/protocolVersion"`
+			Capabilities map[string]json.RawMessage `json:"io.modelcontextprotocol/clientCapabilities"`
+		} `json:"_meta"`
+	}
+	if failure := decodeParams(raw, &params); failure != nil {
+		return failure
+	}
+	if params.Meta.Version == nil {
+		return &rpcError{Code: -32602, Message: "_meta.io.modelcontextprotocol/protocolVersion is required (supported: " + protocolVersion + ")"}
+	}
+	if params.Meta.Capabilities == nil {
+		return &rpcError{Code: -32602, Message: "_meta.io.modelcontextprotocol/clientCapabilities must be an object"}
+	}
+	if *params.Meta.Version != protocolVersion {
+		return &rpcError{Code: -32022, Message: "Unsupported protocol version", Data: map[string]any{
+			"supported": []string{protocolVersion}, "requested": *params.Meta.Version,
+		}}
 	}
 	return nil
 }

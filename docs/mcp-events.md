@@ -13,20 +13,46 @@ override is needed. The configured HTTP client supplies authentication and API
 gateway routing. No webhook endpoint,
 Hookdeck account, additional token, or GitHub repository mutation is required.
 
-The server implements the experimental [MCP Events draft](https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md)
+The server implements [SEP-3415: Events Extension](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/3415)
 with native `events/list` and `events/poll`. The event `github.workflow_run`
-advertises **poll** delivery. The draft allows any nonempty subset of delivery
+advertises **poll** delivery. The extension allows any nonempty subset of delivery
 modes. Push and webhook delivery are not advertised. Discovery uses MCP
 `server/discover`, protocol version `2026-07-28`; this command does not implement
-legacy `initialize`. A read-only `list_workflow_runs` MCP tool exposes current
+legacy `initialize`. Discovery declares event support under
+`capabilities.extensions["io.modelcontextprotocol/events"]`, with no dynamic
+catalog notifications. Every successful result includes `resultType: "complete"`
+and identifies the server in `_meta["io.modelcontextprotocol/serverInfo"]`.
+A read-only `list_workflow_runs` MCP tool exposes current
 run snapshots for context. There are no `wait_for_event` or `poll_events` tools.
 
+Every request, including `server/discover`, must include the standard per-request
+metadata in `params`:
+
+```json
+{
+  "_meta": {
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientCapabilities": {}
+  }
+}
+```
+
+The client may declare `io.modelcontextprotocol/events` in its capability
+`extensions` map. This declaration is optional for client-initiated event
+requests. Missing required metadata returns `InvalidParams` (`-32602`). An
+unsupported version returns `UnsupportedProtocolVersion` (`-32022`) with the
+requested and supported versions.
+
 Optional subscription arguments `branch`, `workflow`, `status`, and `conclusion`
-are exact-match filters. Omitted arguments watch every observed change in the
+are exact-match string filters, including an explicitly empty string. Null values
+are invalid. Omitted arguments watch every observed change in the
 selected repository. A null or omitted cursor bootstraps from now, returning
 no historical events. A client retains the response-level cursor and polls
 again after `nextPollMs` (default 15000); `hasMore` drains a partial batch
-immediately. `--interval` controls the minimum time between shared API reads.
+immediately. `maxEvents` caps each batch, with a default of 50 and a server ceiling
+of 100; larger requested caps are accepted. `maxAgeMs` optionally bounds replay
+by age and is ignored when starting from now. `--interval` controls the minimum
+time between shared API reads.
 Concurrent subscriptions reuse the same observation cache.
 
 The source samples the latest 100 Actions runs. Intermediate transitions may
